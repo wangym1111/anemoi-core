@@ -251,5 +251,73 @@ class AnemoiModelInterface(torch.nn.Module):
         # Delegate to the model's predict_step implementation with processors
         return self.model.predict_step(**predict_kwargs, **kwargs)
 
+    def encode_latent_step(
+        self,
+        batch: dict[str, torch.Tensor],
+        model_comm_group: Optional[ProcessGroup] = None,
+        **kwargs,
+    ) -> dict[str, torch.Tensor | str]:
+        """Encode raw inference-layout tensors into an autoencoder latent state.
+
+        ``batch`` tensors have shape ``batch x time x grid x variables`` before
+        preprocessing. The returned latent contains ``z`` with shape
+        ``batch x hidden_grid x channels``.
+        """
+
+        if not hasattr(self.model, "encode_latent"):
+            msg = f"{self.model.__class__.__name__} does not implement encode_latent()."
+            raise AttributeError(msg)
+
+        with torch.no_grad():
+            x = {}
+            for dataset_name, tensor in batch.items():
+                if tensor.ndim != 4:
+                    msg = (
+                        f"The {dataset_name} input tensor must have shape batch x time x grid x variables, "
+                        f"got {tuple(tensor.shape)}."
+                    )
+                    raise ValueError(msg)
+                x[dataset_name] = tensor[:, 0 : self.n_step_input, None, ...]
+                x[dataset_name] = self.pre_processors[dataset_name](x[dataset_name], in_place=False)
+
+            return self.model.encode_latent(x, model_comm_group=model_comm_group, **kwargs)
+
+    def decode_latent_step(
+        self,
+        latent: dict[str, torch.Tensor] | torch.Tensor,
+        template: dict[str, torch.Tensor],
+        model_comm_group: Optional[ProcessGroup] = None,
+        **kwargs,
+    ) -> dict[str, torch.Tensor]:
+        """Decode an autoencoder latent state using raw inference-layout templates.
+
+        ``template`` tensors have shape ``batch x time x grid x variables`` and
+        provide forcing variables, dtype, and output-grid information for the
+        decoder. Returned tensors have shape ``batch x time x grid x variables``
+        after Anemoi postprocessing.
+        """
+
+        if not hasattr(self.model, "decode_latent"):
+            msg = f"{self.model.__class__.__name__} does not implement decode_latent()."
+            raise AttributeError(msg)
+
+        with torch.no_grad():
+            x = {}
+            for dataset_name, tensor in template.items():
+                if tensor.ndim != 4:
+                    msg = (
+                        f"The {dataset_name} template tensor must have shape batch x time x grid x variables, "
+                        f"got {tuple(tensor.shape)}."
+                    )
+                    raise ValueError(msg)
+                x[dataset_name] = tensor[:, 0 : self.n_step_output, None, ...]
+                x[dataset_name] = self.pre_processors[dataset_name](x[dataset_name], in_place=False)
+
+            y_hat = self.model.decode_latent(latent, x, model_comm_group=model_comm_group, **kwargs)
+            for dataset_name in y_hat:
+                y_hat[dataset_name] = self.post_processors[dataset_name](y_hat[dataset_name], in_place=False)
+                y_hat[dataset_name] = y_hat[dataset_name].squeeze(2)
+            return y_hat
+
     def _update_metadata(self) -> None:
         self.model.fill_metadata(self.metadata)

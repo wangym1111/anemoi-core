@@ -239,3 +239,139 @@ class AnemoiModelAutoEncoder(AnemoiModelEncProcDec):
             )
 
         return x_out_dict
+
+    def encode_latent(
+        self,
+        x: dict[str, Tensor],
+        *,
+        model_comm_group: Optional[ProcessGroup] = None,
+        grid_shard_sizes: DatasetShardSizes | None = None,
+        **kwargs,
+    ) -> dict[str, Tensor | str]:
+        """Encode model-space autoencoder inputs into hidden latent tensors.
+
+        Input tensors must have shape ``batch x time x ensemble x grid x variables``
+        and must already be in model space, i.e. after Anemoi preprocessors.
+        The returned ``z`` tensor has shape ``batch x hidden_grid x channels``.
+        """
+
+        del kwargs
+        dataset_names = list(x.keys())
+        batch_size = self._get_consistent_dim(x, 0)
+        ensemble_size = self._get_consistent_dim(x, 2)
+
+        in_out_sharded = self._resolve_in_out_sharded(
+            dataset_names=dataset_names,
+            grid_shard_sizes=grid_shard_sizes,
+        )
+        for dataset_name in dataset_names:
+            self._assert_valid_sharding(batch_size, ensemble_size, in_out_sharded[dataset_name], model_comm_group)
+
+        dataset_latents = {}
+        x_hidden_latent = self.node_attributes(self._graph_name_hidden, batch_size=batch_size)
+        shard_sizes_hidden = get_shard_sizes(x_hidden_latent, 0, model_comm_group)
+        x_hidden_latent = shard_tensor(x_hidden_latent, 0, shard_sizes_hidden, model_comm_group)
+
+        for dataset_name in dataset_names:
+            x_data_latent, shard_sizes_data = self._assemble_input(
+                x[dataset_name], batch_size, grid_shard_sizes, model_comm_group, dataset_name
+            )
+
+            (
+                encoder_edge_attr,
+                encoder_edge_index,
+                enc_edge_shard_sizes,
+            ) = self.encoder_graph_provider[dataset_name].get_edges(
+                batch_size=batch_size,
+                model_comm_group=model_comm_group,
+            )
+            enc_shard_info = BipartiteGraphShardInfo(
+                src_nodes=shard_sizes_data,
+                dst_nodes=shard_sizes_hidden,
+                edges=enc_edge_shard_sizes,
+            )
+
+            _, x_latent = self.encoder[dataset_name](
+                (x_data_latent, x_hidden_latent),
+                batch_size=batch_size,
+                shard_info=enc_shard_info,
+                edge_attr=encoder_edge_attr,
+                edge_index=encoder_edge_index,
+                model_comm_group=model_comm_group,
+                keep_x_dst_sharded=True,
+            )
+            dataset_latents[dataset_name] = x_latent
+
+        x_latent = sum(dataset_latents.values())
+        z = einops.rearrange(x_latent, "(batch grid) channels -> batch grid channels", batch=batch_size)
+        return {"z": z, "hidden_nodes_name": self._graph_name_hidden}
+
+    def decode_latent(
+        self,
+        latent: dict[str, Tensor] | Tensor,
+        template: dict[str, Tensor],
+        *,
+        model_comm_group: Optional[ProcessGroup] = None,
+        grid_shard_sizes: DatasetShardSizes | None = None,
+        **kwargs,
+    ) -> dict[str, Tensor]:
+        """Decode hidden latent tensors back into model-space autoencoder outputs.
+
+        ``template`` supplies batch size, ensemble size, dtype, output grid, and
+        any decoding forcing variables required by the autoencoder decoder.
+        """
+
+        del kwargs
+        dataset_names = list(template.keys())
+        batch_size = self._get_consistent_dim(template, 0)
+        ensemble_size = self._get_consistent_dim(template, 2)
+        z = latent["z"] if isinstance(latent, dict) else latent
+        if z.ndim != 3:
+            msg = f"Expected latent tensor with shape batch x hidden_grid x channels, got {tuple(z.shape)}."
+            raise ValueError(msg)
+        x_latent = einops.rearrange(z, "batch grid channels -> (batch grid) channels")
+        shard_sizes_hidden = get_shard_sizes(x_latent, 0, model_comm_group)
+
+        in_out_sharded = self._resolve_in_out_sharded(
+            dataset_names=dataset_names,
+            grid_shard_sizes=grid_shard_sizes,
+        )
+        for dataset_name in dataset_names:
+            self._assert_valid_sharding(batch_size, ensemble_size, in_out_sharded[dataset_name], model_comm_group)
+
+        x_out_dict = {}
+        for dataset_name in dataset_names:
+            x_target_latent, shard_sizes_target = self._assemble_forcings(
+                template[dataset_name], batch_size, grid_shard_sizes, model_comm_group, dataset_name
+            )
+
+            (
+                decoder_edge_attr,
+                decoder_edge_index,
+                dec_edge_shard_sizes,
+            ) = self.decoder_graph_provider[dataset_name].get_edges(
+                batch_size=batch_size,
+                model_comm_group=model_comm_group,
+            )
+
+            dec_shard_info = BipartiteGraphShardInfo(
+                src_nodes=shard_sizes_hidden,
+                dst_nodes=shard_sizes_target,
+                edges=dec_edge_shard_sizes,
+            )
+
+            x_out = self.decoder[dataset_name](
+                (x_latent, x_target_latent),
+                batch_size=batch_size,
+                shard_info=dec_shard_info,
+                edge_attr=decoder_edge_attr,
+                edge_index=decoder_edge_index,
+                model_comm_group=model_comm_group,
+                keep_x_dst_sharded=in_out_sharded[dataset_name],
+            )
+
+            x_out_dict[dataset_name] = self._assemble_output(
+                x_out, batch_size, ensemble_size, template[dataset_name].dtype, dataset_name
+            )
+
+        return x_out_dict
