@@ -248,16 +248,89 @@ def _load_anemoi_model(checkpoint: Path, *, device: str) -> torch.nn.Module:
 
         model, _metadata = load_and_prepare_model(str(checkpoint))
     except (RuntimeError, TypeError, ValueError, AttributeError, ImportError, FileNotFoundError):
-        LOG.debug("Falling back to direct torch.load for %s", checkpoint, exc_info=True)
-        model = torch.load(checkpoint, map_location=target_device, weights_only=False)
-        if isinstance(model, dict) and "model" in model:
-            model = model["model"]
-    if not isinstance(model, torch.nn.Module):
-        msg = f"Checkpoint {checkpoint} did not load to a torch.nn.Module; got {type(model)!r}."
-        raise TypeError(msg)
+        LOG.debug("Falling back to direct Lightning checkpoint loading for %s", checkpoint, exc_info=True)
+        payload = torch.load(checkpoint, map_location=target_device, weights_only=False)
+        model = _model_from_checkpoint_payload(payload, checkpoint, target_device)
+
+    model = _select_latent_interface(model)
     model.to(target_device)
     model.eval()
     return model
+
+
+def _model_from_checkpoint_payload(payload: Any, checkpoint: Path, target_device: torch.device) -> torch.nn.Module:
+    if isinstance(payload, torch.nn.Module):
+        return payload
+    if not isinstance(payload, dict):
+        msg = f"Checkpoint {checkpoint} did not load to a supported payload; got {type(payload)!r}."
+        raise TypeError(msg)
+    if isinstance(payload.get("model"), torch.nn.Module):
+        return payload["model"]
+    if "state_dict" in payload and "hyper_parameters" in payload:
+        return _load_lightning_training_module(checkpoint, payload, target_device)
+    msg = (
+        f"Checkpoint {checkpoint} did not contain a model object or a Lightning "
+        "state_dict/hyper_parameters payload."
+    )
+    raise TypeError(msg)
+
+
+def _load_lightning_training_module(
+    checkpoint: Path,
+    payload: dict[str, Any],
+    target_device: torch.device,
+) -> torch.nn.Module:
+    from hydra.utils import get_class
+
+    config = payload.get("hyper_parameters", {}).get("config")
+    target = _get_nested(config, "training", "method", "_target_")
+    if target is None:
+        msg = "Lightning checkpoint hyper_parameters.config.training.method._target_ is missing."
+        raise ValueError(msg)
+
+    training_cls = get_class(str(target))
+    try:
+        module = training_cls.load_from_checkpoint(
+            str(checkpoint),
+            map_location=target_device,
+            weights_only=False,
+        )
+    except TypeError:
+        module = training_cls.load_from_checkpoint(str(checkpoint), map_location=target_device)
+    if not isinstance(module, torch.nn.Module):
+        msg = f"Lightning checkpoint {checkpoint} loaded to {type(module)!r}, expected torch.nn.Module."
+        raise TypeError(msg)
+    return module
+
+
+def _select_latent_interface(model: torch.nn.Module) -> torch.nn.Module:
+    if hasattr(model, "encode_latent_step") and hasattr(model, "decode_latent_step"):
+        return model
+    wrapped = getattr(model, "model", None)
+    if isinstance(wrapped, torch.nn.Module):
+        if hasattr(wrapped, "encode_latent_step") and hasattr(wrapped, "decode_latent_step"):
+            return wrapped
+        nested = getattr(wrapped, "model", None)
+        if isinstance(nested, torch.nn.Module) and hasattr(nested, "encode_latent"):
+            msg = (
+                "Loaded a raw autoencoder without AnemoiModelInterface preprocessors. "
+                "Use a training checkpoint or inference checkpoint that contains the interface."
+            )
+            raise TypeError(msg)
+    msg = f"Loaded model {model.__class__.__name__} does not expose latent encode/decode helpers."
+    raise TypeError(msg)
+
+
+def _get_nested(value: Any, *keys: str) -> Any:
+    current = value
+    for key in keys:
+        if current is None:
+            return None
+        if isinstance(current, dict):
+            current = current.get(key)
+        else:
+            current = getattr(current, key, None)
+    return current
 
 
 def _validate_anemoi_dataset_shape(data: Any, member_index: int) -> None:
