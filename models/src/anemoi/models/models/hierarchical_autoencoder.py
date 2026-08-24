@@ -231,6 +231,289 @@ class AnemoiModelHierarchicalAutoEncoder(AnemoiModelAutoEncoder):
                 edge_dim=self.decoder_graph_provider[dataset_name].edge_dim,
             )
 
+    def encode_latent(
+        self,
+        x: dict[str, torch.Tensor],
+        *,
+        model_comm_group: Optional[ProcessGroup] = None,
+        grid_shard_sizes: DatasetShardSizes | None = None,
+        **kwargs,
+    ) -> dict[str, torch.Tensor | str]:
+        """Encode hierarchical autoencoder inputs into the innermost latent state.
+
+        The hierarchical autoencoder decoder uses per-level latents created by the
+        downscale path. Export them alongside ``z`` so ``decode_latent`` can mirror
+        the trained forward pass instead of bypassing the hierarchy.
+        """
+
+        del kwargs
+        dataset_names = list(x.keys())
+        batch_size = self._get_consistent_dim(x, 0)
+        ensemble_size = self._get_consistent_dim(x, 2)
+
+        in_out_sharded = self._resolve_in_out_sharded(
+            dataset_names=dataset_names,
+            grid_shard_sizes=grid_shard_sizes,
+        )
+        for dataset_name in dataset_names:
+            self._assert_valid_sharding(batch_size, ensemble_size, in_out_sharded[dataset_name], model_comm_group)
+
+        x_hidden_latents = {}
+        shard_sizes_hidden_dict = {}
+        for hidden in self._graph_name_hidden:
+            x_hidden = self.node_attributes(hidden, batch_size=batch_size)
+            shard_sizes_hidden_dict[hidden] = get_shard_sizes(x_hidden, 0, model_comm_group=model_comm_group)
+            x_hidden_latents[hidden] = shard_tensor(x_hidden, 0, shard_sizes_hidden_dict[hidden], model_comm_group)
+
+        dataset_latents = {}
+        x_encoded_latents_dict: dict[str, dict[str, torch.Tensor]] = {}
+
+        for dataset_name in dataset_names:
+            x_data_latent, shard_sizes_data = self._assemble_input(
+                x[dataset_name],
+                batch_size=batch_size,
+                grid_shard_sizes=grid_shard_sizes,
+                model_comm_group=model_comm_group,
+                dataset_name=dataset_name,
+            )
+
+            (
+                encoder_edge_attr,
+                encoder_edge_index,
+                enc_edge_shard_sizes,
+            ) = self.encoder_graph_provider[dataset_name].get_edges(
+                batch_size=batch_size,
+                model_comm_group=model_comm_group,
+            )
+
+            enc_shard_info = BipartiteGraphShardInfo(
+                src_nodes=shard_sizes_data,
+                dst_nodes=shard_sizes_hidden_dict[self._graph_name_hidden[0]],
+                edges=enc_edge_shard_sizes,
+            )
+
+            _, x_latent = self.encoder[dataset_name](
+                (x_data_latent, x_hidden_latents[self._graph_name_hidden[0]]),
+                batch_size=batch_size,
+                shard_info=enc_shard_info,
+                edge_attr=encoder_edge_attr,
+                edge_index=encoder_edge_index,
+                model_comm_group=model_comm_group,
+                keep_x_dst_sharded=True,
+            )
+
+            x_encoded_latents_dict[dataset_name] = {}
+
+            for i in range(0, self.num_hidden - 1):
+                src_hidden_name = self._graph_name_hidden[i]
+                dst_hidden_name = self._graph_name_hidden[i + 1]
+
+                if self.level_process:
+                    (
+                        down_level_edge_attr,
+                        down_level_edge_index,
+                        down_edge_shard_sizes,
+                    ) = self.down_level_processor_graph_providers[src_hidden_name].get_edges(
+                        batch_size=batch_size,
+                        model_comm_group=model_comm_group,
+                    )
+
+                    x_latent = self.down_level_processor[src_hidden_name](
+                        x_latent,
+                        batch_size=batch_size,
+                        shard_info=GraphShardInfo(
+                            nodes=shard_sizes_hidden_dict[src_hidden_name],
+                            edges=down_edge_shard_sizes,
+                        ),
+                        edge_attr=down_level_edge_attr,
+                        edge_index=down_level_edge_index,
+                        model_comm_group=model_comm_group,
+                    )
+
+                (
+                    downscale_edge_attr,
+                    downscale_edge_index,
+                    ds_edge_shard_sizes,
+                ) = self.downscale_graph_providers[src_hidden_name].get_edges(
+                    batch_size=batch_size,
+                    model_comm_group=model_comm_group,
+                )
+
+                ds_shard_info = BipartiteGraphShardInfo(
+                    src_nodes=shard_sizes_hidden_dict[src_hidden_name],
+                    dst_nodes=shard_sizes_hidden_dict[dst_hidden_name],
+                    edges=ds_edge_shard_sizes,
+                )
+
+                x_encoded_latents_dict[dataset_name][src_hidden_name], x_latent = self.downscale[src_hidden_name](
+                    (x_latent, x_hidden_latents[dst_hidden_name]),
+                    batch_size=batch_size,
+                    shard_info=ds_shard_info,
+                    edge_attr=downscale_edge_attr,
+                    edge_index=downscale_edge_index,
+                    model_comm_group=model_comm_group,
+                    keep_x_dst_sharded=True,
+                )
+
+            dataset_latents[dataset_name] = x_latent
+
+        x_latent = sum(dataset_latents.values())
+        result: dict[str, torch.Tensor | str] = {
+            "z": torch.reshape(x_latent, (batch_size, -1, x_latent.shape[-1])),
+            "hidden_nodes_name": self._graph_name_hidden[-1],
+            "latent_kind": "hierarchical_autoencoder",
+        }
+        for dataset_name, level_latents in x_encoded_latents_dict.items():
+            for hidden_name, tensor in level_latents.items():
+                key = f"skip/{dataset_name}/{hidden_name}"
+                result[key] = torch.reshape(tensor, (batch_size, -1, tensor.shape[-1]))
+        return result
+
+    def decode_latent(
+        self,
+        latent: dict[str, torch.Tensor] | torch.Tensor,
+        template: dict[str, torch.Tensor],
+        *,
+        model_comm_group: Optional[ProcessGroup] = None,
+        grid_shard_sizes: DatasetShardSizes | None = None,
+        **kwargs,
+    ) -> dict[str, torch.Tensor]:
+        """Decode a hierarchical latent state back into model-space outputs."""
+
+        del kwargs
+        if not isinstance(latent, dict):
+            msg = (
+                "Hierarchical autoencoder decoding requires the per-level skip latents exported by "
+                "encode_latent(); pass the full latent dictionary, not only z."
+            )
+            raise ValueError(msg)
+
+        dataset_names = list(template.keys())
+        batch_size = self._get_consistent_dim(template, 0)
+        ensemble_size = self._get_consistent_dim(template, 2)
+        z = latent["z"]
+        if z.ndim != 3:
+            msg = f"Expected latent tensor with shape batch x hidden_grid x channels, got {tuple(z.shape)}."
+            raise ValueError(msg)
+        x_latent = torch.reshape(z, (-1, z.shape[-1]))
+
+        in_out_sharded = self._resolve_in_out_sharded(
+            dataset_names=dataset_names,
+            grid_shard_sizes=grid_shard_sizes,
+        )
+        for dataset_name in dataset_names:
+            self._assert_valid_sharding(batch_size, ensemble_size, in_out_sharded[dataset_name], model_comm_group)
+
+        shard_sizes_hidden_dict = {}
+        for hidden in self._graph_name_hidden:
+            x_hidden = self.node_attributes(hidden, batch_size=batch_size)
+            shard_sizes_hidden_dict[hidden] = get_shard_sizes(x_hidden, 0, model_comm_group=model_comm_group)
+
+        x_out_dict = {}
+        for dataset_name in dataset_names:
+            x_dataset_latent = x_latent
+            for i in range(self.num_hidden - 1, 0, -1):
+                src_hidden_name = self._graph_name_hidden[i]
+                dst_hidden_name = self._graph_name_hidden[i - 1]
+                skip_key = f"skip/{dataset_name}/{dst_hidden_name}"
+                if skip_key not in latent:
+                    msg = (
+                        f"Missing {skip_key!r}; hierarchical autoencoder decode requires latent stores "
+                        "created by the corrected encode-dataset command."
+                    )
+                    raise KeyError(msg)
+                x_skip = latent[skip_key]
+                if x_skip.ndim != 3:
+                    msg = f"Expected {skip_key!r} with shape batch x hidden_grid x channels, got {tuple(x_skip.shape)}."
+                    raise ValueError(msg)
+                x_skip = torch.reshape(x_skip, (-1, x_skip.shape[-1]))
+
+                (
+                    upscale_edge_attr,
+                    upscale_edge_index,
+                    us_edge_shard_sizes,
+                ) = self.upscale_graph_providers[src_hidden_name].get_edges(
+                    batch_size=batch_size,
+                    model_comm_group=model_comm_group,
+                )
+
+                us_shard_info = BipartiteGraphShardInfo(
+                    src_nodes=shard_sizes_hidden_dict[src_hidden_name],
+                    dst_nodes=shard_sizes_hidden_dict[dst_hidden_name],
+                    edges=us_edge_shard_sizes,
+                )
+
+                x_dataset_latent = self.upscale[src_hidden_name](
+                    (x_dataset_latent, x_skip),
+                    batch_size=batch_size,
+                    shard_info=us_shard_info,
+                    edge_attr=upscale_edge_attr,
+                    edge_index=upscale_edge_index,
+                    model_comm_group=model_comm_group,
+                    keep_x_dst_sharded=True,
+                )
+
+                if self.level_process:
+                    (
+                        up_level_edge_attr,
+                        up_level_edge_index,
+                        up_edge_shard_sizes,
+                    ) = self.up_level_processor_graph_providers[dst_hidden_name].get_edges(
+                        batch_size=batch_size,
+                        model_comm_group=model_comm_group,
+                    )
+
+                    x_dataset_latent = self.up_level_processor[dst_hidden_name](
+                        x_dataset_latent,
+                        edge_attr=up_level_edge_attr,
+                        edge_index=up_level_edge_index,
+                        batch_size=batch_size,
+                        shard_info=GraphShardInfo(
+                            nodes=shard_sizes_hidden_dict[dst_hidden_name],
+                            edges=up_edge_shard_sizes,
+                        ),
+                        model_comm_group=model_comm_group,
+                    )
+
+            x_target_latent, shard_sizes_target = self._assemble_forcings(
+                template[dataset_name], batch_size, grid_shard_sizes, model_comm_group, dataset_name
+            )
+
+            (
+                decoder_edge_attr,
+                decoder_edge_index,
+                dec_edge_shard_sizes,
+            ) = self.decoder_graph_provider[dataset_name].get_edges(
+                batch_size=batch_size,
+                model_comm_group=model_comm_group,
+            )
+
+            dec_shard_info = BipartiteGraphShardInfo(
+                src_nodes=shard_sizes_hidden_dict[self._graph_name_hidden[0]],
+                dst_nodes=shard_sizes_target,
+                edges=dec_edge_shard_sizes,
+            )
+
+            x_out = self.decoder[dataset_name](
+                (x_dataset_latent, x_target_latent),
+                batch_size=batch_size,
+                shard_info=dec_shard_info,
+                edge_attr=decoder_edge_attr,
+                edge_index=decoder_edge_index,
+                model_comm_group=model_comm_group,
+                keep_x_dst_sharded=in_out_sharded[dataset_name],
+            )
+
+            x_out_dict[dataset_name] = self._assemble_output(
+                x_out,
+                batch_size,
+                ensemble_size,
+                template[dataset_name].dtype,
+                dataset_name,
+            )
+
+        return x_out_dict
+
     def forward(
         self,
         x: dict[str, torch.Tensor],
@@ -327,8 +610,8 @@ class AnemoiModelHierarchicalAutoEncoder(AnemoiModelAutoEncoder):
 
             ## Downscale
             for i in range(0, self.num_hidden - 1):
-                src_hidden_name = self._graph_hidden_names[i]
-                dst_hidden_name = self._graph_hidden_names[i + 1]
+                src_hidden_name = self._graph_name_hidden[i]
+                dst_hidden_name = self._graph_name_hidden[i + 1]
 
                 ## Processing at same level
                 if self.level_process:

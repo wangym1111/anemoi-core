@@ -138,12 +138,15 @@ def encode_dataset(
 
     z_array = None
     logvar_array = None
+    extra_arrays: dict[str, Any] = {}
+    latent_tensor_keys: list[str] = ["z", "mu", "logvar"]
     sample_index_array = root.create_dataset(
         "sample_index",
         shape=(len(indices),),
         chunks=(max(1, zarr_chunk_samples),),
         dtype="i8",
     )
+    sample_index_array.attrs["_ARRAY_DIMENSIONS"] = ["sample"]
 
     cursor = 0
     for batch_indices in _batched(indices, batch_size):
@@ -151,8 +154,16 @@ def encode_dataset(
         latent = model.encode_latent_step({dataset_name: batch})
         z = _as_numpy(latent["z"])
         logvar = np.zeros_like(z, dtype=z.dtype)
+        extra_latents = {
+            key: _as_numpy(value)
+            for key, value in latent.items()
+            if key not in {"z", "mu", "logvar"} and isinstance(value, torch.Tensor)
+        }
 
         if z_array is None:
+            for key, value in latent.items():
+                if not isinstance(value, torch.Tensor):
+                    root.attrs[f"latent_{key}"] = value
             chunks = (max(1, zarr_chunk_samples), z.shape[1], z.shape[2])
             z_array = root.create_dataset(
                 "z",
@@ -162,12 +173,28 @@ def encode_dataset(
             )
             root.create_dataset("mu", shape=z_array.shape, chunks=chunks, dtype=z.dtype)
             logvar_array = root.create_dataset("logvar", shape=z_array.shape, chunks=chunks, dtype=z.dtype)
+            for name in ("z", "mu", "logvar"):
+                root[name].attrs["_ARRAY_DIMENSIONS"] = ["sample", "hidden_node", "latent_channel"]
             root.attrs["latent_shape"] = tuple(int(v) for v in z_array.shape)
+
+            for key, value in extra_latents.items():
+                extra_chunks = (max(1, zarr_chunk_samples), value.shape[1], value.shape[2])
+                extra_arrays[key] = root.create_dataset(
+                    key,
+                    shape=(len(indices), value.shape[1], value.shape[2]),
+                    chunks=extra_chunks,
+                    dtype=value.dtype,
+                )
+                extra_arrays[key].attrs["_ARRAY_DIMENSIONS"] = ["sample", "hidden_node", "latent_channel"]
+                latent_tensor_keys.append(key)
+            root.attrs["latent_tensor_keys"] = latent_tensor_keys
 
         next_cursor = cursor + z.shape[0]
         z_array[cursor:next_cursor] = z
         root["mu"][cursor:next_cursor] = z
         logvar_array[cursor:next_cursor] = logvar
+        for key, value in extra_latents.items():
+            extra_arrays[key][cursor:next_cursor] = value
         sample_index_array[cursor:next_cursor] = np.asarray(batch_indices, dtype=np.int64)
         cursor = next_cursor
 
@@ -218,8 +245,14 @@ def decode_latent(
         stop = min(start + batch_size, int(z_array.shape[0]))
         selected = [int(i) for i in sample_indices[start:stop]]
         template = _read_anemoi_batch(data, selected, member_index).to(model_device(model))
-        z = torch.as_tensor(np.asarray(z_array[start:stop]), device=model_device(model))
-        decoded = model.decode_latent_step({"z": z}, {dataset_name: template})
+        latent_batch = {
+            "z": torch.as_tensor(np.asarray(z_array[start:stop]), device=model_device(model)),
+        }
+        for key in _stored_latent_tensor_keys(latent_root):
+            if key in {"z", "mu", "logvar"}:
+                continue
+            latent_batch[key] = torch.as_tensor(np.asarray(latent_root[key][start:stop]), device=model_device(model))
+        decoded = model.decode_latent_step(latent_batch, {dataset_name: template})
         reconstruction = _as_numpy(decoded[dataset_name][:, 0])
         reconstruction = np.moveaxis(reconstruction, 2, 1)
 
@@ -232,10 +265,18 @@ def decode_latent(
                 dtype=reconstruction.dtype,
             )
             root.attrs["reconstruction_shape"] = tuple(int(v) for v in reconstruction_array.shape)
+            reconstruction_array.attrs["_ARRAY_DIMENSIONS"] = ["sample", "variable", "grid"]
 
         reconstruction_array[start:stop] = reconstruction
 
     return output
+
+
+def _stored_latent_tensor_keys(latent_root: Any) -> list[str]:
+    keys = latent_root.attrs.get("latent_tensor_keys")
+    if keys is None:
+        return ["z"]
+    return [str(key) for key in keys]
 
 
 def _load_anemoi_model(checkpoint: Path, *, device: str) -> torch.nn.Module:
