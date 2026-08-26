@@ -10,6 +10,11 @@
 from .aggregate import TimeAggregateLossWrapper
 from .combined import CombinedLoss
 from .haar_wavelet import HaarWaveletLoss
+from .energy_score import EnergyScoreLoss
+from .graph_edge_crps import GraphEdgeCRPSLoss
+from .graph_edge_energy_score import GraphEdgeEnergyScoreLoss
+from .graph_energy_score import GraphEnergyScoreLoss
+from .graph_variogram_score import GraphVariogramScoreLoss
 from .huber import HuberLoss
 from .kcrps import CRPS
 from .logcosh import LogCoshLoss
@@ -30,8 +35,13 @@ from .weighted_mse import WeightedMSELoss
 __all__ = [
     "CRPS",
     "CombinedLoss",
+    "EnergyScoreLoss",
     "FourierCorrelationLoss",
     "HaarWaveletLoss",
+    "GraphEdgeCRPSLoss",
+    "GraphEdgeEnergyScoreLoss",
+    "GraphEnergyScoreLoss",
+    "GraphVariogramScoreLoss",
     "HuberLoss",
     "LogCoshLoss",
     "LogFFT2Distance",
