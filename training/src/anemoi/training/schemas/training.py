@@ -321,6 +321,38 @@ class CRPSSchema(BaseLossSchema):
     "Deactivate autocast for the kernel CRPS calculation"
 
 
+class HaarWaveletLossSchema(BaseLossSchema):
+    """Schema for the 2-D Haar wavelet multiscale loss."""
+
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    target_: Literal["anemoi.training.losses.HaarWaveletLoss"] = Field(..., alias="_target_")
+    x_dim: PositiveInt
+    "Size of the regular-grid x dimension."
+    y_dim: PositiveInt
+    "Size of the regular-grid y dimension."
+    num_scales: PositiveInt | None = None
+    "Number of repeated Haar decompositions. Defaults to the maximum supported by the grid."
+    level_weights: list[NonNegativeFloat] | None = None
+    "Per-detail-level weights. Length must match num_scales when specified."
+    lowpass_weight: NonNegativeFloat = 1.0
+    "Weight applied to the final low-pass approximation band."
+    subband_weights: dict[Literal["lh", "hl", "hh", "ll"], NonNegativeFloat] | None = None
+    "Optional weights for Haar subbands."
+    include_lowpass: bool = True
+    "Include the final low-pass approximation band."
+    normalization: Literal["none", "band", "scale"] = "none"
+    "Wavelet coefficient loss normalization."
+    coefficient_normalization: Literal["orthonormal", "average"] = "orthonormal"
+    "Haar coefficient normalization."
+    odd_size_mode: Literal["error", "trim", "pad"] = "pad"
+    "How odd spatial dimensions are handled at each decomposition level."
+    loss: Literal["mse", "huber"] = "mse"
+    "Pointwise loss applied to wavelet residual coefficients."
+    delta: float = Field(default=1.0, gt=0.0)
+    "Huber threshold when loss is 'huber'."
+
+
 class GraphLossMatrixSchema(BaseModel):
     """One graph-backed smoothing matrix definition for multiscale loss."""
 
@@ -377,7 +409,7 @@ class TimeAggregateLossWrapperSchema(BaseModel):
     target_: Literal["anemoi.training.losses.aggregate.TimeAggregateLossWrapper"] = Field(..., alias="_target_")
     time_aggregation_types: list[Literal["diff", "mean", "min", "max"]] = Field(min_length=1)
     "Time aggregation operations to apply over the time dimension before computing the loss."
-    loss_fn: BaseLossSchema | CRPSSchema
+    loss_fn: HaarWaveletLossSchema | BaseLossSchema | CRPSSchema
     "Inner loss function applied to each time-aggregated output."
     scalers: list[str] | None = None
     "Scalers to apply to the wrapped loss (delegated to inner loss_fn)."
@@ -540,6 +572,8 @@ def _loss_discriminator(v: Any) -> str:
         return "multiscale"
     if target == "anemoi.training.losses.CRPS":
         return "crps"
+    if target == "anemoi.training.losses.HaarWaveletLoss":
+        return "haar_wavelet"
     if target in {
         "anemoi.training.losses.FourierCorrelationLoss",
         "anemoi.training.losses.LogSpectralDistance",
@@ -574,6 +608,7 @@ class CombinedLossSchema(BaseLossSchema):
             Annotated[BaseLossSchema, Tag("base")]
             | Annotated[HuberLossSchema, Tag("huber")]
             | Annotated[CRPSSchema, Tag("crps")]
+            | Annotated[HaarWaveletLossSchema, Tag("haar_wavelet")]
             | Annotated[SpectralLossSchema, Tag("spectral")]
             | Annotated[MultiScaleLossSchema, Tag("multiscale")]
             | Annotated[TimeAggregateLossWrapperSchema, Tag("time_aggregate")],
@@ -629,6 +664,7 @@ LossSchemas = Annotated[
     | Annotated[HuberLossSchema, Tag("huber")]
     | Annotated[CombinedLossSchema, Tag("combined")]
     | Annotated[CRPSSchema, Tag("crps")]
+    | Annotated[HaarWaveletLossSchema, Tag("haar_wavelet")]
     | Annotated[SpectralLossSchema, Tag("spectral")]
     | Annotated[TimeAggregateLossWrapperSchema, Tag("time_aggregate")]
     | Annotated[MultiScaleLossSchema, Tag("multiscale")],

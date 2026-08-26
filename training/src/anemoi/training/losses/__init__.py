@@ -9,6 +9,7 @@
 
 from .aggregate import TimeAggregateLossWrapper
 from .combined import CombinedLoss
+from .haar_wavelet import HaarWaveletLoss
 from .huber import HuberLoss
 from .kcrps import CRPS
 from .logcosh import LogCoshLoss
@@ -30,6 +31,7 @@ __all__ = [
     "CRPS",
     "CombinedLoss",
     "FourierCorrelationLoss",
+    "HaarWaveletLoss",
     "HuberLoss",
     "LogCoshLoss",
     "LogFFT2Distance",

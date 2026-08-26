@@ -136,6 +136,7 @@ class CombinedLoss(BaseLoss):
 
             self.add_module(str(i), self.losses[-1])
         self.loss_weights = loss_weights
+        self.supports_sharding = all(getattr(loss, "supports_sharding", True) for loss in self.losses)
         del self.scaler  # Remove scaler property from parent class, as it is not used here
 
     @property
