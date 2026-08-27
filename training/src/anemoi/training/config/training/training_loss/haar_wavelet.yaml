@@ -1,0 +1,23 @@
+# loss function for regular-grid 2-D Haar multiscale training
+datasets:
+  data:
+    _target_: anemoi.training.losses.HaarWaveletLoss
+    # Set these to the regular grid shape matching the flattened grid dimension.
+    x_dim: 720
+    y_dim: 361
+    num_scales: 4
+    level_weights: [1.0, 1.0, 1.0, 1.0]
+    lowpass_weight: 1.0
+    subband_weights:
+      lh: 1.0
+      hl: 1.0
+      hh: 1.0
+      ll: 1.0
+    # "none" preserves Anemoi scaler/reduction semantics. Use "band" or "scale"
+    # to average wavelet coefficients within each subband or detail scale.
+    normalization: none
+    coefficient_normalization: orthonormal
+    odd_size_mode: pad
+    loss: mse
+    scalers: ['pressure_level', 'general_variable', 'nan_mask_weights', 'node_weights', 'time_steps']
+    ignore_nans: False

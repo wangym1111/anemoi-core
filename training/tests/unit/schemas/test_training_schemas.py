@@ -12,6 +12,7 @@ from pydantic import ValidationError
 
 from anemoi.training.schemas.training import BaseDDPStrategySchema
 from anemoi.training.schemas.training import CombinedLossSchema
+from anemoi.training.schemas.training import HaarWaveletLossSchema
 from anemoi.training.schemas.training import MultiscaleConfigDiskSchema
 from anemoi.training.schemas.training import MultiscaleConfigOnTheFlySchema
 from anemoi.training.schemas.training import MultiScaleLossSchema
@@ -67,6 +68,33 @@ def test_time_aggregate_loss_config_empty_agg_types() -> None:
     cfg = {**_TIME_AGG_CFG, "time_aggregation_types": []}
     with pytest.raises(ValidationError):
         TimeAggregateLossWrapperSchema(**cfg)
+
+
+def test_haar_wavelet_loss_schema_valid() -> None:
+    schema = HaarWaveletLossSchema(
+        _target_="anemoi.training.losses.HaarWaveletLoss",
+        x_dim=720,
+        y_dim=361,
+        num_scales=4,
+        level_weights=[1.0, 0.5, 0.25, 0.125],
+        subband_weights={"lh": 1.0, "hl": 1.0, "hh": 1.5, "ll": 0.5},
+        normalization="none",
+        scalers=["node_weights"],
+    )
+
+    assert schema.target_ == "anemoi.training.losses.HaarWaveletLoss"
+    assert schema.odd_size_mode == "pad"
+
+
+def test_haar_wavelet_loss_schema_rejects_invalid_mode() -> None:
+    with pytest.raises(ValidationError):
+        HaarWaveletLossSchema(
+            _target_="anemoi.training.losses.HaarWaveletLoss",
+            x_dim=4,
+            y_dim=4,
+            scalers=[],
+            normalization="invalid",
+        )
 
 
 def test_optimizer_schema_allows_extra_keys() -> None:
@@ -222,6 +250,23 @@ def test_combined_loss_with_multiscale_valid() -> None:
                 {
                     **_MULTISCALE_BASE,
                     "multiscale_config": _ON_THE_FLY_MULTISCALE_CONFIG,
+                },
+            ],
+        },
+    )
+
+
+def test_combined_loss_with_haar_wavelet_valid() -> None:
+    CombinedLossSchema(
+        **{
+            **_COMBINED_LOSS_BASE,
+            "losses": [
+                {
+                    "_target_": "anemoi.training.losses.HaarWaveletLoss",
+                    "x_dim": 4,
+                    "y_dim": 4,
+                    "num_scales": 2,
+                    "scalers": ["node_weights"],
                 },
             ],
         },

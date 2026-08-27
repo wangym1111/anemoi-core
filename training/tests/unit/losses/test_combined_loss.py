@@ -18,6 +18,7 @@ from omegaconf import DictConfig
 from torch_geometric.data import HeteroData
 
 from anemoi.training.losses import CombinedLoss
+from anemoi.training.losses import HaarWaveletLoss
 from anemoi.training.losses import MAELoss
 from anemoi.training.losses import MSELoss
 from anemoi.training.losses import PowerSpectrumLoss
@@ -92,6 +93,18 @@ def test_combined_loss_equal_weighting() -> None:
         scalers={},
     )
     assert all(weight == 1.0 for weight in loss.loss_weights)
+
+
+def test_combined_loss_reports_sharding_unsupported_when_child_does() -> None:
+    """CombinedLoss should gather full grids when any child loss needs that."""
+    loss = CombinedLoss(
+        losses=(
+            MSELoss(),
+            HaarWaveletLoss(x_dim=2, y_dim=2, num_scales=1),
+        ),
+    )
+
+    assert loss.supports_sharding is False
 
 
 def test_combined_loss_seperate_scalers() -> None:
