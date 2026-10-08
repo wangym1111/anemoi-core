@@ -75,8 +75,14 @@ autoregressive rollout training. It is constructed with:
   ``"6H"``).
 - ``rollout`` — optional dict configuring the rollout schedule (see
   :class:`~anemoi.training.tasks.forecaster.RolloutConfig`).
-- ``validation_rollout`` — number of rollout steps used during
-  validation (default ``1``).
+- ``validation_rollout`` — minimum number of rollout steps unrolled
+  during validation (default ``null``, i.e. follow the training
+  rollout). Validation always unrolls at least the current training
+  rollout. The validation losses ``val_<loss>_loss`` and
+  ``val_<dataset>_<loss>_loss`` are averaged over the current training
+  rollout (``rollout.step``) only, so that they are directly comparable
+  to ``train_<loss>_loss``. The validation metrics are logged for every
+  unrolled step (``val_.../1`` … ``val_.../N``).
 
 RolloutConfig
 =============
@@ -133,6 +139,85 @@ Rollout behavior:
    to load.
 -  If ``multistep_output`` is greater than ``multistep_input``, only the most recent
    ``multistep_input`` outputs are fed into the next rollout step.
+
+
+******************
+ OffsetForecaster
+******************
+
+:class:`~anemoi.training.tasks.forecaster.OffsetForecaster` is an
+experimental generalisation of
+:class:`~anemoi.training.tasks.forecaster.Forecaster` that declares the
+sample directly through time offsets, i.e. times relative to the forecast initialisation time:
+
+- ``input_offsets`` — input time offsets as frequency strings, e.g.
+  ``["-1H", "-30m", "0m"]``. The latest input must be equivalent to ``0H``.
+- ``output_offsets`` — target time offsets as frequency strings, e.g. ``["30M",  "1h"]``.
+
+- ``rollout`` / ``validation_rollout`` — as for
+  :class:`~anemoi.training.tasks.forecaster.Forecaster`.
+
+Examples
+========
+
+Basic forecaster
+----------------
+
+The standard forecaster (two input steps, one output step, ``6H``
+timestep) written with offsets:
+
+.. code:: yaml
+
+  task:
+    _target_: anemoi.training.tasks.OffsetForecaster
+    input_offsets: ["-6H", "0H"]
+    output_offsets: ["6H"]
+    rollout:
+      start: 1
+      epoch_increment: 0
+      maximum: 1
+
+Mixed input/output frequencies
+------------------------------
+
+Read two 6-hourly steps and predict the next six hours at 1-hourly
+resolution:
+
+.. code:: yaml
+
+  task:
+    _target_: anemoi.training.tasks.OffsetForecaster
+    input_offsets: ["-6H", "0H"]
+    output_offsets: ["1H", "2H", "3H", "4H", "5H", "6H"]
+    rollout:
+      start: 1
+      epoch_increment: 1
+      maximum: 6
+
+The rollout shift
+=================
+
+The model can forecast arbitrarily far into the future by rollout: it is
+applied repeatedly, each step feeding its own outputs (and inputs) back as the inputs of
+the next. The ``rollout_shift`` is the time interval between two consecutive
+rollout steps — the amount by which every input and output offset is advanced
+at each step.
+
+By default ``rollout_shift`` is set to the largest possible value. In some
+configurations several shifts are possible, so ``OffsetForecaster`` exposes it as
+an optional argument that lets the user override the default.
+For a shift to be valid, all outputs from one rollout step must precede all outputs
+from the next step; output windows cannot overlap or interleave.
+For example, with a single input and outputs ``["2H", "3H"]`` both ``2H`` and
+``3H`` are possible. ``3H`` is the largest, and therefore the default, but the user can select ``2H`` as follows:
+
+.. code:: yaml
+
+  task:
+    _target_: anemoi.training.tasks.OffsetForecaster
+    input_offsets: ["0H"]
+    output_offsets: ["2H", "3H"]
+    rollout_shift: "2H"   # overwrites the default, 3H
 
 
 *********************
